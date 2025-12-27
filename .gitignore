@@ -1,2 +1,3 @@
 DESTINATION/
+__pycache__/
 !.gitignore

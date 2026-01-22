@@ -2,7 +2,7 @@ import mne
 from sklearn.svm import SVC
 import numpy as np
 from parser import parse_seizure_file
-
+from neal import SimulatedAnnealingSampler
 DURATION = 1.0
 
 
@@ -49,6 +49,41 @@ def preprocess_one_file(edf_path, seizure_times):
 
     return X_data, y_data
 
+
+def solve_qubo_seizure(all_scores, lmbda=0.5,threshold=0.5):
+    """
+    輸入: 
+        all_scores: SVM 產出的機率向量 (E,)
+        lmbda: 平滑係數 (控制連續性的強弱)
+    輸出:
+        y_star: 優化後的二元序列 (0 或 1)
+    """
+    
+    E = len(all_scores)
+    Q = {} # 使用字典格式儲存稀疏矩陣，對 D-Wave 較友善
+
+    # 1. 建構 Unary Terms (對角線)
+    # 我們偏移一下機率，讓 < 0.5 變成正能量(偏向0)，> 0.5 變成負能量(偏向1)
+    for e in range(E):
+        Q[(e, e)] = -(all_scores[e] - threshold)
+
+    # 2. 建構 Pairwise Terms (時間平滑)
+    for e in range(E - 1):
+        # 罰金項: lambda * (y_e - y_{e+1})^2
+        Q[(e, e)] += lmbda
+        Q[(e+1, e+1)] += lmbda
+        Q[(e, e+1)] = -2 * lmbda
+
+    # 3. 使用模擬退火求解 (模擬量子運算行為)
+    sampler = SimulatedAnnealingSampler()
+    # num_reads 是抽樣次數，可以先設 10-50 次
+    sampleset = sampler.sample_qubo(Q, num_reads=20)
+    
+    # 取得能量最低的最佳解
+    best_sample = sampleset.first.sample
+    y_star = np.array([best_sample[i] for i in range(E)])
+    
+    return y_star
 
 if __name__ == "__main__":
     # 讀取發作時間資料

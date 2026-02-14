@@ -39,6 +39,7 @@ for test_file in seizure_files:
     # 2. 訓練模型
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train_all)
+    X_train_scaled = X_train_scaled.astype('float32')#轉成float
     clf = SVC(probability=True, kernel='rbf', class_weight='balanced',verbose= True)
     clf.fit(X_train_scaled, y_train_all)
     print("訓練完成！開始測試...")

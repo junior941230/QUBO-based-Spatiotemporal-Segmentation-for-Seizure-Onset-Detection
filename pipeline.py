@@ -1,5 +1,4 @@
 import mne
-from sklearn.svm import SVC
 import numpy as np
 from parser import parse_seizure_file
 from neal import SimulatedAnnealingSampler

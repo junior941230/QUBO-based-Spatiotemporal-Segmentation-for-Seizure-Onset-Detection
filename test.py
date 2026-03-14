@@ -1,4 +1,4 @@
-from pipeline import preprocess_one_file, solve_qubo_seizure
-
+import mne
 if __name__ == "__main__":
-    raw = preprocess_one_file('DESTINATION/chb01/chb01_03.edf', [(0, 10), (20, 30)])
+    montage = mne.channels.make_standard_montage('standard_1020')
+    print(montage)

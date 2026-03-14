@@ -2,7 +2,6 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import f1_score
 from pipeline import processAllFiles, solve_qubo_seizure
-from FeatureExtraction import extract_band_power
 from parser import parse_seizure_file
 from cuml.svm import SVC
 from cuml.preprocessing import StandardScaler
@@ -16,7 +15,7 @@ SUMMARY_PATH = "DESTINATION/chb01/chb01-summary.txt"
 DATA_DIR = "DESTINATION/chb01/"
 
 # 獲取所有 EDF 檔案
-seizure_files = [file.name for file in Path(DATA_DIR).iterdir() if file.suffix == '.edf']
+seizure_files = sorted([file.name for file in Path(DATA_DIR).iterdir() if file.suffix == '.edf'])
 
 seizures = parse_seizure_file(SUMMARY_PATH)
 
@@ -50,7 +49,7 @@ for testFile in seizure_files:
 
     # 3. 準備測試集
     xTestFeat = cp.asarray(allDataFeatures[testFile])
-    yTest = allDataLabels[testFile]
+    yTest = np.asarray(allDataLabels[testFile]).astype(int)
 
     xTestScaled = scaler.transform(xTestFeat)
     # 4. 取得分數與 QUBO 優化
@@ -65,15 +64,18 @@ for testFile in seizure_files:
     y_qubo = solve_qubo_seizure(scores, lmbda=1.5, threshold=0.45)
     
     # 5. 紀錄結果
-    b_f1 = f1_score(yTest, y_baseline)
-    q_f1 = f1_score(yTest, y_qubo)
+    b_f1 = f1_score(yTest, y_baseline, zero_division=0)
+    q_f1 = f1_score(yTest, y_qubo, zero_division=0)
     results.append({
         'File': testFile,
+        'Num_Test_Samples': len(yTest),
+        'Num_Positive': int(np.sum(yTest)),
+        'Baseline_Positive_Pred': int(np.sum(y_baseline)),
+        'QUBO_Positive_Pred': int(np.sum(y_qubo)),
         'Baseline_F1': b_f1,
         'QUBO_F1': q_f1,
         'Improvement': q_f1 - b_f1
     })
-    
     print(f"檔案 {testFile} 完成！提升幅度: {q_f1 - b_f1:.4f}")
 
 # --- 6. 輸出總結表 ---

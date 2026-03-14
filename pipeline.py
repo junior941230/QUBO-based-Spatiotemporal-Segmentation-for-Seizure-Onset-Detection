@@ -13,6 +13,18 @@ def preprocess_one_file(edf_path, seizure_times):
     # verbose=False 可以讓它安靜一點
     raw = mne.io.read_raw_edf(edf_path, preload=True, verbose=False)
 
+    # 假設 raw 是你讀取後的物件
+    channelNames = raw.ch_names
+
+    # 找出所有包含 T8-P8 的通道
+    targetChannels = [ch for ch in channelNames if 'T8-P8' in ch]
+
+    if len(targetChannels) > 1:
+        # 做法 A：保留第一個，刪除其餘重複項
+        # 這裡我們刪除 T8-P8-1
+        print(f"找到多個 T8-P8 通道: {targetChannels}，將保留第一個並刪除其餘。")
+        raw.drop_channels(['T8-P8-1'])
+
     # 3. 濾波
     raw.filter(l_freq=0.5, h_freq=40.0, verbose=False)  # Bandpass
     raw.notch_filter(freqs=60.0, verbose=False)        # Notch
@@ -49,7 +61,7 @@ def preprocess_one_file(edf_path, seizure_times):
     return X_data, y_data
 
 
-def solve_qubo_seizure(all_scores, lmbda=0.5,threshold=0.5):
+def solve_qubo_seizure(all_scores, lmbda=0.5, threshold=0.5):
     """
     輸入: 
         all_scores: SVM 產出的機率向量 (E,)
@@ -57,9 +69,9 @@ def solve_qubo_seizure(all_scores, lmbda=0.5,threshold=0.5):
     輸出:
         y_star: 優化後的二元序列 (0 或 1)
     """
-    
+
     E = len(all_scores)
-    Q = {} # 使用字典格式儲存稀疏矩陣，對 D-Wave 較友善
+    Q = {}  # 使用字典格式儲存稀疏矩陣，對 D-Wave 較友善
 
     # 1. 建構 Unary Terms (對角線)
     # 我們偏移一下機率，讓 < 0.5 變成正能量(偏向0)，> 0.5 變成負能量(偏向1)
@@ -77,12 +89,13 @@ def solve_qubo_seizure(all_scores, lmbda=0.5,threshold=0.5):
     sampler = SimulatedAnnealingSampler()
     # num_reads 是抽樣次數，可以先設 10-50 次
     sampleset = sampler.sample_qubo(Q, num_reads=20)
-    
+
     # 取得能量最低的最佳解
     best_sample = sampleset.first.sample
     y_star = np.array([best_sample[i] for i in range(E)])
-    
+
     return y_star
+
 
 if __name__ == "__main__":
     # 讀取發作時間資料

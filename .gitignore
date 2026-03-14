@@ -1,3 +1,4 @@
 DESTINATION/
 __pycache__/
+.vscode/
 !.gitignore

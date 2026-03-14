@@ -33,7 +33,7 @@ for test_file in seizure_files:
     
     X_train_all = np.concatenate(X_train_list).astype('float32') # 轉為 float32
     y_train_all = np.concatenate(y_train_list).astype('float32') # cuml SVM 標籤也建議用 float32
-    
+
     # 2. 訓練模型 (使用 GPU)
     scaler = StandardScaler() # 使用 GPU 加速的標標準化
     X_train_scaled = scaler.fit_transform(X_train_all)
@@ -71,6 +71,7 @@ for test_file in seizure_files:
         'QUBO_F1': q_f1,
         'Improvement': q_f1 - b_f1
     })
+    
     print(f"檔案 {test_file} 完成！提升幅度: {q_f1 - b_f1:.4f}")
 
 # --- 6. 輸出總結表 ---

@@ -1,9 +1,35 @@
 import mne
+import os
+import warnings
 import numpy as np
 from parser import parse_seizure_file
+from FeatureExtraction import extract_band_power
 from neal import SimulatedAnnealingSampler
+from joblib import Parallel, delayed
 DURATION = 1.0
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="mne")
 
+def processAllFiles(fileList, seizureTimesDict, nJobs=-1):
+    """
+    fileList: 檔案路徑清單
+    seizureTimesDict: 字典，Key 為檔名，Value 為該檔案的發作時間片段 [(start, end), ...]
+    nJobs: 使用的核心數，-1 代表使用全部 CPU
+    """
+    # 使用 joblib 進行並行處理
+    # verbose=10 可以看到進度條
+    results = Parallel(n_jobs=nJobs, verbose=10)(
+        delayed(preprocess_one_file)(f, seizureTimesDict.get(os.path.basename(f), [])) 
+        for f in fileList
+    )
+    
+    allDataFeatures = {}    
+    allDataLabels = {}
+    filenameList = [os.path.basename(f) for f in fileList]
+    for i, (xData, yData) in enumerate(results):
+        allDataFeatures[filenameList[i]] = xData
+        allDataLabels[filenameList[i]] = yData
+
+    return allDataFeatures , allDataLabels
 
 def preprocess_one_file(edf_path, seizure_times):
     """
@@ -20,14 +46,12 @@ def preprocess_one_file(edf_path, seizure_times):
     targetChannels = [ch for ch in channelNames if 'T8-P8' in ch]
 
     if len(targetChannels) > 1:
-        # 做法 A：保留第一個，刪除其餘重複項
-        # 這裡我們刪除 T8-P8-1
-        print(f"找到多個 T8-P8 通道: {targetChannels}，將保留第一個並刪除其餘。")
+        # 刪除 T8-P8-1
         raw.drop_channels(['T8-P8-1'])
 
     # 3. 濾波
-    raw.filter(l_freq=0.5, h_freq=40.0, verbose=False)  # Bandpass
-    raw.notch_filter(freqs=60.0, verbose=False)        # Notch
+    raw.filter(l_freq=0.5, h_freq=40.0, verbose=False, n_jobs=1)  # Bandpass
+    raw.notch_filter(freqs=60.0, verbose=False, n_jobs=1)        # Notch
 
     # 4. 切割 Epochs (例如 1 秒一段)
 
@@ -37,28 +61,19 @@ def preprocess_one_file(edf_path, seizure_times):
     # 取得數據矩陣 X: (Epoch數, 通道數, 時間點數)
     X_data = epochs.get_data(copy=True)
 
+    X_feat = np.array([extract_band_power(e) for e in X_data])
+
     # 5. 製作標籤 y
     # 先產生全 0 的向量
-    num_epochs = len(X_data)
-    y_data = np.zeros(num_epochs)
+    numEpochs = len(X_feat)
+    y_data = np.zeros(numEpochs)
 
-    # 根據 Parser 給的時間填入 1
-    # raw.first_samp 是檔案開始的採樣點索引，raw.info['sfreq'] 是採樣率(256Hz)
-    sfreq = raw.info['sfreq']
+    for start, end in seizure_times:
+        sIdx = max(0, int(start / DURATION))
+        eIdx = min(numEpochs, int(end / DURATION))
+        y_data[sIdx:eIdx] = 1
 
-    for start_sec, end_sec in seizure_times:
-        # 將秒數轉換成 Epoch 的 index
-        start_idx = int(start_sec / DURATION)
-        end_idx = int(end_sec / DURATION)
-
-        # 邊界檢查，防止超出範圍
-        start_idx = max(0, start_idx)
-        end_idx = min(num_epochs, end_idx)
-
-        # 標記為發作 (1)
-        y_data[start_idx: end_idx] = 1
-
-    return X_data, y_data
+    return X_feat, y_data
 
 
 def solve_qubo_seizure(all_scores, lmbda=0.5, threshold=0.5):

@@ -11,36 +11,31 @@ import datetime
 import cupy as cp
 
 # --- 設定 ---
-SUMMARY_PATH = "DESTINATION/chb01/chb01-summary.txt"
-DATA_DIR = "DESTINATION/chb01/"
+summaryPath = "DESTINATION/chb01/chb01-summary.txt"
+dataDir = "DESTINATION/chb01/"
 
 # 獲取所有 EDF 檔案
-seizure_files = sorted([file.name for file in Path(DATA_DIR).iterdir() if file.suffix == '.edf'])
+seizureFiles = sorted([file.name for file in Path(dataDir).iterdir() if file.suffix == '.edf'])
 
-seizures = parse_seizure_file(SUMMARY_PATH)
+seizures = parse_seizure_file(summaryPath)
 
 print("正在預處理所有檔案...")
-allDataFeatures , allDataLabels = processAllFiles([os.path.join(DATA_DIR, f) for f in seizure_files], seizures)  # 這裡會使用多核心加速預處理
-
+allDataFeatures, allDataLabels = processAllFiles([os.path.join(dataDir, f) for f in seizureFiles], seizures)
 
 results = []
 
-for testFile in seizure_files:
+for testFile in seizureFiles:
     print(f"\n>>> 正在測試檔案: {testFile} (使用 GPU 加速) <<<")
-    trainFeaturesList = [cp.asarray(allDataFeatures[f]) for f in seizure_files if f != testFile]
-    trainLabelsList = [cp.asarray(allDataLabels[f]) for f in seizure_files if f != testFile]
-    # 使用 cupy 或 numpy 快速合併
-    # 如果 preprocess_one_file 已經回傳 GPU 陣列，這裡會非常快
+    trainFeaturesList = [cp.asarray(allDataFeatures[f]) for f in seizureFiles if f != testFile]
+    trainLabelsList = [cp.asarray(allDataLabels[f]) for f in seizureFiles if f != testFile]
     xTrainAll = cp.vstack(trainFeaturesList)
     yTrainAll = cp.concatenate(trainLabelsList)
     print(f"訓練資料處理完成。特徵維度: {xTrainAll.shape}")
 
     # 2. 訓練模型 (使用 GPU)
-    scaler = StandardScaler() # 使用 GPU 加速的標標準化
+    scaler = StandardScaler()
     xTrainScaled = scaler.fit_transform(xTrainAll)
     
-    # cuml.SVC 的參數與 sklearn 幾乎一致
-    # verbose=False 可以減少雜訊，想看進度可設 True
     clf = SVC(probability=True, kernel='rbf', class_weight='balanced', verbose=False)
     
     print(f"正在 GPU 上訓練 SVM (樣本數: {xTrainAll.shape[0]})...")
@@ -53,37 +48,36 @@ for testFile in seizure_files:
 
     xTestScaled = scaler.transform(xTestFeat)
     # 4. 取得分數與 QUBO 優化
-    # 注意：predict_proba 在 GPU 上極快
     scores = clf.predict_proba(xTestScaled)[:, 1]
 
     # 轉回 numpy 格式供 QUBO (CPU) 使用
-    if hasattr(scores, 'get'): # 如果是 cupy 陣列則轉回 numpy
+    if hasattr(scores, 'get'):
         scores = scores.get()
     
-    y_baseline = (scores > 0.5).astype(int)
-    y_qubo = solve_qubo_seizure(scores, lmbda=1.5, threshold=0.45)
+    yBaseline = (scores > 0.5).astype(int)
+    yQubo = solve_qubo_seizure(scores, lmbda=1.5, threshold=0.45)
     
     # 5. 紀錄結果
-    b_f1 = f1_score(yTest, y_baseline, zero_division=0)
-    q_f1 = f1_score(yTest, y_qubo, zero_division=0)
+    bF1 = f1_score(yTest, yBaseline, zero_division=0)
+    qF1 = f1_score(yTest, yQubo, zero_division=0)
     results.append({
         'File': testFile,
         'Num_Test_Samples': len(yTest),
         'Num_Positive': int(np.sum(yTest)),
-        'Baseline_Positive_Pred': int(np.sum(y_baseline)),
-        'QUBO_Positive_Pred': int(np.sum(y_qubo)),
-        'Baseline_F1': b_f1,
-        'QUBO_F1': q_f1,
-        'Improvement': q_f1 - b_f1
+        'Baseline_Positive_Pred': int(np.sum(yBaseline)),
+        'QUBO_Positive_Pred': int(np.sum(yQubo)),
+        'Baseline_F1': bF1,
+        'QUBO_F1': qF1,
+        'Improvement': qF1 - bF1
     })
-    print(f"檔案 {testFile} 完成！提升幅度: {q_f1 - b_f1:.4f}")
+    print(f"檔案 {testFile} 完成！提升幅度: {qF1 - bF1:.4f}")
 
 # --- 6. 輸出總結表 ---
-df_results = pd.DataFrame(results)
-output_dir = "experimentLogs"
-os.makedirs(output_dir, exist_ok=True)
-df_results.to_pickle(f"{output_dir}/{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_gpu_results.pkl")  # 儲存結果以供後續分析
+dfResults = pd.DataFrame(results)
+outputDir = "experimentLogs"
+os.makedirs(outputDir, exist_ok=True)
+dfResults.to_pickle(f"{outputDir}/{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_gpu_results.pkl")
 print("\n" + "="*40)
 print("GPU 實驗總結報告")
-print(df_results)
-print(f"平均提升幅度: {df_results['Improvement'].mean():.4f}")
+print(dfResults)
+print(f"平均提升幅度: {dfResults['Improvement'].mean():.4f}")

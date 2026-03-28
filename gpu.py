@@ -3,6 +3,7 @@ import pandas as pd
 from sklearn.metrics import f1_score
 from pipeline import processAllFiles, solve_qubo_seizure
 from parser import parse_seizure_file
+from xgboost import XGBClassifier
 from cuml.svm import SVC
 from cuml.preprocessing import StandardScaler
 from pathlib import Path 
@@ -50,11 +51,17 @@ def train_and_get_scores(trainFiles, valFile, allDataFeatures, allDataLabels):
     xValScaled = scaler.transform(xVal)
 
     # 訓練 SVM
-    clf = SVC(probability=True, kernel='rbf', class_weight='balanced', verbose=False)
-    clf.fit(xTrainScaled, yTrain)
+    # clf = SVC(probability=True, kernel='rbf', class_weight='balanced', verbose=False)
+    # clf.fit(xTrainScaled, yTrain)
+    # scores = clf.predict_proba(xValScaled)[:, 1]
+
+    # XGBoost
+    bst = XGBClassifier(n_estimators=500, max_depth=6, learning_rate=0.1, objective='binary:logistic',device='cuda')
+    bst.fit(xTrainScaled.get(), yTrain.get())
+    scores = bst.predict_proba(xValScaled)[:, 1]
 
     # 預測 validation 機率
-    scores = clf.predict_proba(xValScaled)[:, 1]
+    
     if hasattr(scores, 'get'):
         scores = scores.get()
     else:

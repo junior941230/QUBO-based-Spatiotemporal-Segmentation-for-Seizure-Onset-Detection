@@ -60,8 +60,8 @@ def ValScoreVsImprovement(df):
     plt.savefig("val_score_vs_improvement.png")
 
 if __name__ == "__main__":
-    dfnew = pd.read_pickle("experimentLogs/20260323_032622_gpu_results.pkl")
-    dfold = pd.read_pickle("experimentLogs/20260322_144711_gpu_results.pkl")
+    dfold = pd.read_pickle("experimentLogs/20260323_032622_svm_results.pkl")
+    dfnew = pd.read_pickle("experimentLogs/20260328_170826_XG_results.pkl")
     
     df_seizureNew = dfnew[dfnew["Num_Positive"] > 0]
     df_seizureOld = dfold[dfold["Num_Positive"] > 0]
@@ -81,8 +81,8 @@ if __name__ == "__main__":
     old_values = [df_seizureOld["Baseline_F1"].mean(), df_seizureOld["QUBO_F1"].mean(), df_seizureOld["Improvement"].mean()]
     
     x = range(len(categories))
-    plt.bar([i - 0.2 for i in x], new_values, width=0.4, label="New")
-    plt.bar([i + 0.2 for i in x], old_values, width=0.4, label="Old")
+    plt.bar([i - 0.2 for i in x], new_values, width=0.4, label="XGBoost")
+    plt.bar([i + 0.2 for i in x], old_values, width=0.4, label="SVM")
     plt.xticks(x, categories)
     plt.ylabel("Score")
     plt.title("New vs Old Comparison")

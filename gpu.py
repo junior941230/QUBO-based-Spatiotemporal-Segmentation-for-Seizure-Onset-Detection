@@ -164,11 +164,16 @@ for testFile in seizureFiles:
     # 2. 訓練模型 (使用 GPU)
     scaler = StandardScaler()
     xTrainScaled = scaler.fit_transform(xTrainAll)
+
     
-    clf = SVC(probability=True, kernel='rbf', class_weight='balanced', verbose=False)
+    
+
+    #clf = SVC(probability=True, kernel='rbf', class_weight='balanced', verbose=False)
+    bst = XGBClassifier(n_estimators=500, max_depth=6, learning_rate=0.1, objective='binary:logistic',device='cuda')
     
     print(f"正在 GPU 上訓練 SVM (樣本數: {xTrainAll.shape[0]})...")
-    clf.fit(xTrainScaled, yTrainAll)
+    #clf.fit(xTrainScaled, yTrainAll)
+    bst.fit(xTrainScaled.get(), yTrainAll.get())
     print("GPU 訓練完成！")
 
     # 3. 準備測試集
@@ -177,7 +182,8 @@ for testFile in seizureFiles:
 
     xTestScaled = scaler.transform(xTestFeat)
     # 4. 取得分數與 QUBO 優化
-    scores = clf.predict_proba(xTestScaled)[:, 1]
+    #scores = clf.predict_proba(xTestScaled)[:, 1]
+    scores = bst.predict_proba(xTestScaled)[:, 1]
 
     # 轉回 numpy 格式供 QUBO (CPU) 使用
     if hasattr(scores, 'get'):

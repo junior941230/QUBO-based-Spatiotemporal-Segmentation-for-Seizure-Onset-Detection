@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 
 # 讀檔
 
+
 def baselineVSQubo(df):
     # 依 Improvement 排序，比較好看
     df = df.sort_values("Improvement", ascending=False)
@@ -19,6 +20,7 @@ def baselineVSQubo(df):
     plt.tight_layout()
     plt.savefig("resultVisualize/baseline_vs_qubo.png")
 
+
 def improvement(df):
     df = df.sort_values("Improvement", ascending=False)
     plt.figure(figsize=(14, 6))
@@ -29,6 +31,7 @@ def improvement(df):
     plt.axhline(0, linestyle="--")
     plt.tight_layout()
     plt.savefig("resultVisualize/improvement.png")
+
 
 def bestParam(df):
     plt.figure(figsize=(8, 4))
@@ -47,6 +50,7 @@ def bestParam(df):
     plt.tight_layout()
     plt.savefig("resultVisualize/best_threshold.png")
 
+
 def ValScoreVsImprovement(df):
     plt.figure(figsize=(6, 5))
     plt.scatter(df["Val_Score"], df["Improvement"])
@@ -59,10 +63,11 @@ def ValScoreVsImprovement(df):
     plt.tight_layout()
     plt.savefig("val_score_vs_improvement.png")
 
+
 if __name__ == "__main__":
     dfold = pd.read_pickle("experimentLogs/20260323_032622_svm_results.pkl")
-    dfnew = pd.read_pickle("experimentLogs/20260328_170826_XG_results.pkl")
-    
+    dfnew = pd.read_pickle("experimentLogs/20260420_023056_gpu_results.pkl")
+
     df_seizureNew = dfnew[dfnew["Num_Positive"] > 0]
     df_seizureOld = dfold[dfold["Num_Positive"] > 0]
 
@@ -73,13 +78,15 @@ if __name__ == "__main__":
     print("\nOld - Baseline F1:", df_seizureOld["Baseline_F1"].mean())
     print("Old - QUBO F1:", df_seizureOld["QUBO_F1"].mean())
     print("Old - Improvement:", df_seizureOld["Improvement"].mean())
-    
+
     # 比較圖表
     plt.figure(figsize=(10, 5))
     categories = ["Baseline F1", "QUBO F1", "Improvement"]
-    new_values = [df_seizureNew["Baseline_F1"].mean(), df_seizureNew["QUBO_F1"].mean(), df_seizureNew["Improvement"].mean()]
-    old_values = [df_seizureOld["Baseline_F1"].mean(), df_seizureOld["QUBO_F1"].mean(), df_seizureOld["Improvement"].mean()]
-    
+    new_values = [df_seizureNew["Baseline_F1"].mean(
+    ), df_seizureNew["QUBO_F1"].mean(), df_seizureNew["Improvement"].mean()]
+    old_values = [df_seizureOld["Baseline_F1"].mean(
+    ), df_seizureOld["QUBO_F1"].mean(), df_seizureOld["Improvement"].mean()]
+
     x = range(len(categories))
     plt.bar([i - 0.2 for i in x], new_values, width=0.4, label="XGBoost")
     plt.bar([i + 0.2 for i in x], old_values, width=0.4, label="SVM")

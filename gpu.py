@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 from sklearn.metrics import f1_score
+from sklearn.model_selection import KFold,StratifiedKFold
 from pipeline import processAllFiles, solve_qubo_seizure
 from parser import parse_seizure_file
 from xgboost import XGBClassifier
@@ -34,6 +35,68 @@ def build_validation_score_cache(trainingFiles, allDataFeatures, allDataLabels):
             "yVal": np.asarray(yVal).astype(int)
         }
 
+    return cache
+
+def build_validation_score_cache_kfold(trainingFiles, allDataFeatures, allDataLabels, n_splits=5):
+    """
+    用 K-Fold 取代 Leave-One-File-Out，大幅減少訓練次數。
+    原本 N-1 次訓練 → 現在只需 K 次訓練。
+    """
+    cache = {}
+    trainArray = np.array(trainingFiles)
+
+    fileHasSeizure = np.array([
+        1 if np.sum(allDataLabels[f]) > 0 else 0
+        for f in trainingFiles
+    ])
+
+    minClassCount = min(np.sum(fileHasSeizure), np.sum(1 - fileHasSeizure))
+    if minClassCount >= n_splits:
+        kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        splitIter = kf.split(trainArray, fileHasSeizure)
+    else:
+        kf = KFold(n_splits=min(n_splits, len(trainingFiles)), shuffle=True, random_state=42)
+        splitIter = kf.split(trainArray)
+
+    for foldIdx, (trainIdx, valIdx) in enumerate(splitIter):
+        innerTrainFiles = trainArray[trainIdx].tolist()
+        valFiles = trainArray[valIdx].tolist()
+
+        print(f"  [Fold {foldIdx + 1}/{kf.n_splits}] "
+              f"train={len(innerTrainFiles)} files, val={len(valFiles)} files")
+
+        xTrain = cp.vstack([cp.asarray(allDataFeatures[f]) for f in innerTrainFiles])
+        yTrain = cp.concatenate([cp.asarray(allDataLabels[f]).astype(cp.int32) for f in innerTrainFiles])
+
+        scaler = StandardScaler()
+        xTrainScaled = scaler.fit_transform(xTrain)
+
+        bst = XGBClassifier(
+            n_estimators=500, max_depth=6, learning_rate=0.1,
+            objective='binary:logistic', device='cuda'
+        )
+        # ✅ 訓練時用 CuPy array，XGBoost 會自動識別為 GPU 資料
+        bst.fit(xTrainScaled, yTrain)
+
+        for valFile in valFiles:
+            xVal = cp.asarray(allDataFeatures[valFile])
+            yVal = np.asarray(allDataLabels[valFile]).astype(int)
+
+            xValScaled = scaler.transform(xVal)
+            # ✅ 預測時也直接傳 CuPy array，不要 .get()
+            scores = bst.predict_proba(xValScaled)[:, 1]
+
+            if hasattr(scores, 'get'):
+                scores = scores.get()
+            else:
+                scores = np.asarray(scores)
+
+            cache[valFile] = {
+                "scores": scores,
+                "yVal": yVal
+            }
+
+    print(f"  [Cache] 完成！共 {len(cache)} 個檔案的 validation scores")
     return cache
 
 def train_and_get_scores(trainFiles, valFile, allDataFeatures, allDataLabels):
@@ -134,10 +197,11 @@ for testFile in seizureFiles:
 
     # Step 1: 建立 inner validation score cache
     print("正在建立 validation score cache...")
-    scoreCache = build_validation_score_cache(
+    scoreCache = build_validation_score_cache_kfold(
         trainingFiles,
         allDataFeatures,
-        allDataLabels
+        allDataLabels,
+        n_splits=5
     )
 
     # --- 先在 training files 上做 inner validation 調參 ---

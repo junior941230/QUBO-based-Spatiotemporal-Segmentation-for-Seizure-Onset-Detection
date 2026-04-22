@@ -65,8 +65,10 @@ def ValScoreVsImprovement(df):
 
 
 if __name__ == "__main__":
-    dfold = pd.read_pickle("experimentLogs/20260323_032622_svm_results.pkl")
-    dfnew = pd.read_pickle("experimentLogs/20260420_023056_gpu_results.pkl")
+    dfold = pd.read_pickle(
+        "experimentLogs/20260421_073735_gpu_results_kfold.pkl")
+    dfnew = pd.read_pickle(
+        "experimentLogs/20260422_052115_gpu_results_opcv.pkl")
 
     df_seizureNew = dfnew[dfnew["Num_Positive"] > 0]
     df_seizureOld = dfold[dfold["Num_Positive"] > 0]
@@ -88,8 +90,8 @@ if __name__ == "__main__":
     ), df_seizureOld["QUBO_F1"].mean(), df_seizureOld["Improvement"].mean()]
 
     x = range(len(categories))
-    plt.bar([i - 0.2 for i in x], new_values, width=0.4, label="XGBoost")
-    plt.bar([i + 0.2 for i in x], old_values, width=0.4, label="SVM")
+    plt.bar([i - 0.2 for i in x], new_values, width=0.4, label="opcv")
+    plt.bar([i + 0.2 for i in x], old_values, width=0.4, label="kfold")
     plt.xticks(x, categories)
     plt.ylabel("Score")
     plt.title("New vs Old Comparison")

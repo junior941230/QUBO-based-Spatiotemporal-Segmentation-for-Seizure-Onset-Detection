@@ -4,8 +4,19 @@ import warnings
 import numpy as np
 from parser import parse_seizure_file
 from FeatureExtraction import extract_band_power
-from neal import SimulatedAnnealingSampler
 from joblib import Parallel, delayed
+from collections import defaultdict
+
+try:
+    import openjij as oj  # noqa: F401
+except ImportError:
+    oj = None
+
+try:
+    from neal import SimulatedAnnealingSampler
+except ImportError:
+    SimulatedAnnealingSampler = None
+
 DURATION = 1.0
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="mne")
 
@@ -85,8 +96,13 @@ def solve_qubo_seizure(all_scores, lmbda=0.5, threshold=0.5):
         y_star: 優化後的二元序列 (0 或 1)
     """
 
+    if SimulatedAnnealingSampler is None:
+        raise ImportError(
+            "solve_qubo_seizure 需要 dwave-neal，請先安裝: pip install dwave-neal"
+        )
+
     E = len(all_scores)
-    Q = {}  # 使用字典格式儲存稀疏矩陣，對 D-Wave 較友善
+    Q = defaultdict(float)  # 使用字典格式儲存稀疏矩陣，對 D-Wave 較友善
 
     # 1. 建構 Unary Terms (對角線)
     # 我們偏移一下機率，讓 < 0.5 變成正能量(偏向0)，> 0.5 變成負能量(偏向1)
@@ -111,6 +127,41 @@ def solve_qubo_seizure(all_scores, lmbda=0.5, threshold=0.5):
 
     return y_star
 
+def solve_chain_qubo_exact(all_scores, lmbda=0.5, threshold=0.5):
+    """
+    針對鏈狀 QUBO 的精確 DP 解法，O(E) 時間複雜度
+    比 SA 快且保證全局最優解
+    """
+    E = len(all_scores)
+    unary = -(all_scores - threshold)  # shape (E,)
+
+    # dp[e][v] = 前 e 個節點，第 e 個取值為 v 時的最小能量
+    INF = float('inf')
+    dp   = np.full((E, 2), INF)
+    path = np.zeros((E, 2), dtype=int)
+
+    # 初始化
+    dp[0, 0] = unary[0] * 0  # y=0 時 unary=0（因為 y*unary[0]）
+    dp[0, 1] = unary[0] * 1
+
+    # 前向遞推
+    for e in range(1, E):
+        for v in range(2):          # 當前節點值
+            for u in range(2):      # 前一節點值
+                # pairwise cost: lambda*(u-v)^2
+                pair_cost = lmbda * (u - v) ** 2
+                cost = dp[e-1, u] + unary[e] * v + pair_cost
+                if cost < dp[e, v]:
+                    dp[e, v] = cost
+                    path[e, v] = u
+
+    # 回溯最佳路徑
+    y_star = np.zeros(E, dtype=int)
+    y_star[E-1] = int(np.argmin(dp[E-1]))
+    for e in range(E-2, -1, -1):
+        y_star[e] = path[e+1, y_star[e+1]]
+
+    return y_star
 
 if __name__ == "__main__":
     # 讀取發作時間資料

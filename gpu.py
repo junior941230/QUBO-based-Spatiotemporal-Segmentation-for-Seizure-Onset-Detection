@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import f1_score
 from sklearn.model_selection import KFold, StratifiedKFold
-from pipeline import processAllFiles, solve_qubo_seizure
+from pipeline import processAllFiles, solve_qubo_seizure, solve_qubo_seizureOJ,solve_chain_qubo_exact
 from parser import parse_seizure_file
 from xgboost import XGBClassifier
 from cuml.svm import SVC
@@ -156,8 +156,9 @@ def tune_qubo_params_from_cache(scoreCache, lambdaList, thresholdList, alpha=0.2
                 scores = data["scores"]
                 yVal = data["yVal"]
 
-                yQuboVal = solve_qubo_seizure(
-                    scores, lmbda=lmbda, threshold=threshold)
+                # yQuboVal = solve_qubo_seizure(
+                #     scores, lmbda=lmbda, threshold=threshold)
+                yQuboVal = solve_chain_qubo_exact(scores, lmbda=lmbda, threshold=threshold)
                 yQuboVal = np.asarray(yQuboVal).astype(int)
 
                 if np.sum(yVal) > 0:
@@ -189,8 +190,8 @@ def tune_qubo_params_from_cache(scoreCache, lambdaList, thresholdList, alpha=0.2
 
 
 # --- 設定 ---
-summaryPath = "DESTINATION/chb01/chb01-summary.txt"
-dataDir = "DESTINATION/chb01/"
+summaryPath = "DESTINATION/chb02/chb02-summary.txt"
+dataDir = "DESTINATION/chb02/"
 
 # 獲取所有 EDF 檔案
 seizureFiles = sorted([file.name for file in Path(
@@ -219,18 +220,18 @@ for testFile in seizureFiles:
     # Step 1: 建立 inner validation score cache
     print("正在建立 validation score cache...")
     cacheStart = time.perf_counter()
-    # scoreCache = build_validation_score_cache_kfold(
-    #     trainingFiles,
-    #     allDataFeatures,
-    #     allDataLabels,
-    #     n_splits=5
-    # )
-
-    scoreCache = build_validation_score_cache(
+    scoreCache = build_validation_score_cache_kfold(
         trainingFiles,
         allDataFeatures,
-        allDataLabels
+        allDataLabels,
+        n_splits=5
     )
+
+    # scoreCache = build_validation_score_cache(
+    #     trainingFiles,
+    #     allDataFeatures,
+    #     allDataLabels
+    # )
     cacheElapsed = time.perf_counter() - cacheStart
     print(f"validation score cache 建立完成，耗時: {cacheElapsed:.2f} 秒")
     # --- 先在 training files 上做 inner validation 調參 ---
@@ -296,8 +297,9 @@ for testFile in seizureFiles:
 
     # --- Baseline 與最佳 QUBO ---
     yBaseline = (scores > 0.5).astype(int)
-    yQubo = solve_qubo_seizure(
-        scores, lmbda=bestLambda, threshold=bestThreshold)
+    # yQubo = solve_qubo_seizure(
+    #     scores, lmbda=bestLambda, threshold=bestThreshold)
+    yQubo = solve_chain_qubo_exact(scores, lmbda=bestLambda, threshold=bestThreshold)
     yQubo = np.asarray(yQubo).astype(int)
     inferElapsed = time.perf_counter() - inferStart
 

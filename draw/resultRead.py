@@ -4,8 +4,10 @@ import matplotlib.pyplot as plt
 if __name__ == "__main__":
     dfold = pd.read_pickle(
         "experimentLogs/20260421_073735_gpu_results_kfold.pkl")
+    print(dfold["QUBO_F1"])
     dfnew = pd.read_pickle(
-        "experimentLogs/20260422_052115_gpu_results_opcv.pkl")
+        "experimentLogs/20260424_094817_gpu_results.pkl")
+    print(dfnew["QUBO_F1"])
     
     df_seizureOld = dfold[dfold["Num_Positive"] > 0]
     df_seizureNew = dfnew[dfnew["Num_Positive"] > 0]

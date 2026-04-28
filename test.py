@@ -1,4 +1,9 @@
-import mne
-if __name__ == "__main__":
-    montage = mne.channels.make_standard_montage('standard_1020')
-    print(montage)
+from pathlib import Path
+from parser import parse_seizure_file
+
+for p in sorted(Path("DESTINATION").glob("chb*/chb*-summary.txt")):
+    try:
+        parse_seizure_file(str(p))
+        print(f"OK   {p.name}")
+    except Exception as exc:
+        print(f"FAIL {p.name}: {exc}")

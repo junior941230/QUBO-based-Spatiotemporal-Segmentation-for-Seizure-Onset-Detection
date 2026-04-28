@@ -2,6 +2,7 @@ import os
 import re
 import time
 import pickle
+import hashlib
 from pathlib import Path
 from datetime import datetime
 
@@ -13,7 +14,6 @@ from sklearn.metrics import f1_score, precision_score, recall_score
 from sklearn.model_selection import KFold, StratifiedKFold
 from cuml.preprocessing import StandardScaler
 from cuml.svm import SVC
-
 
 from parser import parse_seizure_file
 from pipeline import processAllFiles, solve_chain_qubo_exact, solve_qubo_seizure
@@ -30,6 +30,7 @@ except ImportError:
 
 DESTINATION_DIR = Path("DESTINATION")
 RESULTS_DIR = Path("results")
+CHECKPOINT_DIR = Path("checkpoints")
 DEFAULT_LAMBDA_LIST = [0.5, 1.0, 1.5, 2.0, 3.0]
 DEFAULT_THRESHOLD_LIST = [0.3, 0.4, 0.45, 0.5, 0.6]
 TUNE_ALPHA = 0.2
@@ -47,7 +48,6 @@ def log_step(message):
 
 
 def parse_float_list(text, default):
-    """Parse a comma-separated float list from UI input."""
     if not text or not text.strip():
         return list(default)
     try:
@@ -93,6 +93,72 @@ def collect_files_and_seizures(subjects, max_files_per_subject):
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint (Resume Support)
+# ---------------------------------------------------------------------------
+
+def make_run_id(config):
+    """Create a deterministic run id from experiment config."""
+    key_parts = [
+        ",".join(sorted(config["subjects"])),
+        config["baseline"],
+        config["solver_name"],
+        config["tune_mode"],
+        str(config["tune_n_splits"]),
+        str(config["max_files_per_subject"]),
+        ",".join(str(x) for x in config["lambda_list"]),
+        ",".join(str(x) for x in config["threshold_list"]),
+        str(config["reuse_global_cache"]),
+    ]
+    raw = "|".join(key_parts).encode("utf-8")
+    digest = hashlib.md5(raw).hexdigest()[:10]
+    subj_tag = "-".join(config["subjects"][:3])
+    if len(config["subjects"]) > 3:
+        subj_tag += f"+{len(config['subjects']) - 3}"
+    return f"{subj_tag}_{config['baseline']}_{config['solver_name']}_{digest}"
+
+
+def checkpoint_path(run_id):
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    return CHECKPOINT_DIR / f"ckpt_{run_id}.pkl"
+
+
+def load_checkpoint(run_id):
+    path = checkpoint_path(run_id)
+    if not path.exists():
+        return None
+    try:
+        with open(path, "rb") as fp:
+            data = pickle.load(fp)
+        log_step(f"[Ckpt] loaded {path}, done_files={len(data.get('rows', []))}")
+        return data
+    except Exception as exc:
+        log_step(f"[Ckpt] load failed ({exc}), starting fresh")
+        return None
+
+
+def save_checkpoint(run_id, rows, detail_cache, skipped, config):
+    path = checkpoint_path(run_id)
+    payload = {
+        "rows": rows,
+        "detail_cache": detail_cache,
+        "skipped": skipped,
+        "config": config,
+        "updated_at": datetime.now().isoformat(),
+    }
+    tmp = path.with_suffix(".pkl.tmp")
+    with open(tmp, "wb") as fp:
+        pickle.dump(payload, fp, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.replace(path)
+
+
+def clear_checkpoint(run_id):
+    path = checkpoint_path(run_id)
+    if path.exists():
+        path.unlink()
+        log_step(f"[Ckpt] cleared {path}")
+
+
+# ---------------------------------------------------------------------------
 # Model & Solver
 # ---------------------------------------------------------------------------
 
@@ -102,10 +168,8 @@ def predict_scores(baseline, x_train, y_train, x_test):
         x_train_scaled = scaler.fit_transform(x_train)
         x_test_scaled = scaler.transform(x_test)
         clf = SVC(
-            probability=True,
-            kernel="rbf",
-            class_weight="balanced",
-            random_state=RANDOM_SEED,
+            probability=True, kernel="rbf",
+            class_weight="balanced", random_state=RANDOM_SEED,
         )
         clf.fit(x_train_scaled, y_train)
         return clf.predict_proba(x_test_scaled)[:, 1]
@@ -114,15 +178,10 @@ def predict_scores(baseline, x_train, y_train, x_test):
         if XGBClassifier is None:
             raise ImportError("xgboost is not installed")
         clf = XGBClassifier(
-            n_estimators=300,
-            max_depth=6,
-            learning_rate=0.08,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            objective="binary:logistic",
-            eval_metric="logloss",
-            random_state=RANDOM_SEED,
-            n_jobs=4,
+            n_estimators=300, max_depth=6, learning_rate=0.08,
+            subsample=0.9, colsample_bytree=0.9,
+            objective="binary:logistic", eval_metric="logloss",
+            random_state=RANDOM_SEED, n_jobs=4,
         )
         clf.fit(x_train, y_train)
         return clf.predict_proba(x_test)[:, 1]
@@ -139,7 +198,6 @@ def get_qubo_solver(name):
 
 
 def safe_solver_call(solver, scores, lmbda, threshold):
-    """Call QUBO solver with output validation."""
     out = solver(scores, lmbda=float(lmbda), threshold=float(threshold))
     out = np.asarray(out)
     if out.ndim != 1 or out.shape[0] != scores.shape[0]:
@@ -156,9 +214,7 @@ def safe_solver_call(solver, scores, lmbda, threshold):
 def build_validation_score_cache_lofo(candidate_files, features, labels, baseline):
     cache = {}
     log_step(f"[Cache-LOFO] start, files={len(candidate_files)}")
-
     for val_file in candidate_files:
-        log_step(f"[Cache-LOFO] processing val={val_file}")
         inner_train_files = [name for name in candidate_files if name != val_file]
         if not inner_train_files:
             continue
@@ -170,7 +226,6 @@ def build_validation_score_cache_lofo(candidate_files, features, labels, baselin
         y_val = np.asarray(labels[val_file]).astype(int)
         scores = np.asarray(predict_scores(baseline, x_train, y_train, x_val))
         cache[val_file] = {"scores": scores, "y_val": y_val}
-
     log_step(f"[Cache-LOFO] done, cached_files={len(cache)}")
     return cache
 
@@ -181,28 +236,21 @@ def build_validation_score_cache_kfold(candidate_files, features, labels, baseli
     effective_splits = max(2, min(int(n_splits), len(candidate_files)))
     log_step(
         f"[Cache-NFold] start, files={len(candidate_files)}, "
-        f"requested={n_splits}, effective={effective_splits}"
+        f"effective={effective_splits}"
     )
-
     file_has_seizure = np.array([1 if np.sum(labels[f]) > 0 else 0 for f in candidate_files])
     min_class_count = min(np.sum(file_has_seizure), np.sum(1 - file_has_seizure))
 
     if min_class_count >= effective_splits:
         splitter = StratifiedKFold(n_splits=effective_splits, shuffle=True, random_state=RANDOM_SEED)
         split_iter = splitter.split(arr, file_has_seizure)
-        log_step("[Cache-NFold] using StratifiedKFold")
     else:
         splitter = KFold(n_splits=effective_splits, shuffle=True, random_state=RANDOM_SEED)
         split_iter = splitter.split(arr)
-        log_step("[Cache-NFold] using KFold")
 
     for fold_idx, (train_idx, val_idx) in enumerate(split_iter, start=1):
         inner_train_files = arr[train_idx].tolist()
         val_files = arr[val_idx].tolist()
-        log_step(
-            f"[Cache-NFold] fold={fold_idx}, "
-            f"train={len(inner_train_files)}, val={len(val_files)}"
-        )
         x_train = np.concatenate([features[f] for f in inner_train_files])
         y_train = np.concatenate([labels[f] for f in inner_train_files]).astype(int)
         if len(np.unique(y_train)) < 2:
@@ -277,8 +325,7 @@ def build_summary_plot(df):
     nonseizure_df = df[~df["has_seizure"]]
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 4))
-
-    # --- (1) Seizure files: Mean F1 ---
+    
     if len(seizure_df) > 0:
         means_f1 = [seizure_df["baseline_f1"].mean(), seizure_df["qubo_f1"].mean()]
         axes[0].bar(["Baseline", "QUBO"], means_f1, color=["#5B8FF9", "#5AD8A6"])
@@ -292,7 +339,6 @@ def build_summary_plot(df):
         axes[0].set_title("Mean F1 on Seizure Files")
         axes[0].axis("off")
 
-    # --- (2) Non-seizure files: FP rate ---
     if len(nonseizure_df) > 0:
         means_fp = [
             nonseizure_df["baseline_fp_rate"].mean(),
@@ -310,7 +356,6 @@ def build_summary_plot(df):
         axes[1].set_title("Mean FP Rate on Non-seizure Files")
         axes[1].axis("off")
 
-    # --- (3) Improvement distribution (seizure files only) ---
     target_df = seizure_df if len(seizure_df) > 0 else df
     bins = max(1, min(15, len(target_df)))
     axes[2].hist(target_df["improvement"], bins=bins, color="#F6BD16", edgecolor="black")
@@ -347,13 +392,10 @@ def build_detail_plot(detail, baseline, solver_name):
 
 
 # ---------------------------------------------------------------------------
-# Result Saving
+# Result Saving / Loading
 # ---------------------------------------------------------------------------
 
-def save_results_pkl(
-    result_df, detail_cache, meta, output_dir=RESULTS_DIR
-):
-    """Save a complete experiment snapshot as pickle."""
+def save_results_pkl(result_df, detail_cache, meta, output_dir=RESULTS_DIR):
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"qubo_run_{timestamp}.pkl"
@@ -365,16 +407,45 @@ def save_results_pkl(
         "detail_cache": detail_cache,
         "saved_at": timestamp,
     }
-
     with open(filepath, "wb") as fp:
         pickle.dump(payload, fp, protocol=pickle.HIGHEST_PROTOCOL)
-
     log_step(f"[Save] results written to {filepath}")
     return str(filepath)
 
 
+def list_result_pkls(output_dir=RESULTS_DIR):
+    if not output_dir.exists():
+        return []
+    return sorted(
+        (str(p) for p in output_dir.glob("qubo_run_*.pkl")),
+        reverse=True,
+    )
+
+
+def load_result_pkl(path):
+    with open(path, "rb") as fp:
+        return pickle.load(fp)
+
+
+def format_meta(meta):
+    lines = ["## Run Metadata"]
+    for k, v in meta.items():
+        if k in ("notes", "skipped"):
+            continue
+        lines.append(f"- **{k}**: {v}")
+    if meta.get("notes"):
+        lines.append("### Notes")
+        lines.extend(f"- {n}" for n in meta["notes"])
+    if meta.get("skipped"):
+        lines.append("### Skipped")
+        lines.extend(f"- {s}" for s in meta["skipped"][:20])
+        if len(meta["skipped"]) > 20:
+            lines.append(f"- ... and {len(meta['skipped']) - 20} more")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
-# Main Experiment
+# Main Experiment (with Resume)
 # ---------------------------------------------------------------------------
 
 def run_experiment(
@@ -389,18 +460,13 @@ def run_experiment(
     threshold_text,
     reuse_global_cache,
     save_pkl,
+    resume_enabled,
+    force_restart,
     progress=gr.Progress(),
 ):
     if not selected_subjects:
-        return (
-            "Please select at least one subject",
-            pd.DataFrame(),
-            None,
-            None,
-            "",
-        )
+        return "Please select at least one subject", pd.DataFrame(), None, None, "", ""
 
-    # --- Parameter sanitize ---
     n_jobs = int(n_jobs)
     if n_jobs == 0:
         n_jobs = 1
@@ -409,29 +475,54 @@ def run_experiment(
     lambda_list = parse_float_list(lambda_text, DEFAULT_LAMBDA_LIST)
     threshold_list = parse_float_list(threshold_text, DEFAULT_THRESHOLD_LIST)
 
+    config = {
+        "subjects": list(selected_subjects),
+        "baseline": baseline,
+        "solver_name": solver_name,
+        "tune_mode": tune_mode,
+        "tune_n_splits": tune_n_splits,
+        "max_files_per_subject": max_files_per_subject,
+        "lambda_list": lambda_list,
+        "threshold_list": threshold_list,
+        "reuse_global_cache": reuse_global_cache,
+    }
+    run_id = make_run_id(config)
+    log_step(f"[Run] run_id={run_id}")
+
     run_start = time.perf_counter()
-    log_step(
-        f"[Run] start subjects={selected_subjects}, baseline={baseline}, "
-        f"solver={solver_name}, mode={tune_mode}, splits={tune_n_splits}, "
-        f"max_files={max_files_per_subject}, n_jobs={n_jobs}, "
-        f"reuse_cache={reuse_global_cache}, save_pkl={save_pkl}"
-    )
+
+    # --- Resume ---
+    rows = []
+    detail_cache = {}
+    skipped = []
+    done_files = set()
+
+    if force_restart:
+        clear_checkpoint(run_id)
+
+    if resume_enabled and not force_restart:
+        ckpt = load_checkpoint(run_id)
+        if ckpt is not None:
+            rows = ckpt.get("rows", [])
+            detail_cache = ckpt.get("detail_cache", {})
+            skipped = ckpt.get("skipped", [])
+            done_files = {r["file"] for r in rows} | {
+                s.split(":")[0].strip() for s in skipped if ":" in s
+            }
+            log_step(f"[Run] resumed, already done/skipped={len(done_files)}")
 
     # --- Collect files ---
     progress(0.02, desc="Collecting files")
     file_paths, seizure_times, notes = collect_files_and_seizures(
         selected_subjects, max_files_per_subject
     )
-    log_step(f"[Run] files={len(file_paths)}, seizure_map={len(seizure_times)}")
+    log_step(f"[Run] files={len(file_paths)}")
 
     if len(file_paths) < 2:
-        return (
-            "Need at least 2 EDF files to run leave-one-file-out",
-            pd.DataFrame(), None, None, "",
-        )
+        return ("Need at least 2 EDF files", pd.DataFrame(), None, None, "", run_id)
 
     # --- Preprocess ---
-    progress(0.12, desc="Preprocessing EDF files")
+    progress(0.10, desc="Preprocessing EDF files")
     t0 = time.perf_counter()
     features, labels = processAllFiles(file_paths, seizure_times, nJobs=n_jobs)
     log_step(f"[Run] preprocess done, elapsed={time.perf_counter() - t0:.2f}s")
@@ -439,19 +530,16 @@ def run_experiment(
     test_files = [os.path.basename(path) for path in file_paths]
     missing = [f for f in test_files if f not in features or f not in labels]
     if missing:
-        log_step(f"[Run] WARNING missing features for {len(missing)} files, dropping them")
         test_files = [f for f in test_files if f not in missing]
         notes.append(f"Dropped {len(missing)} files with missing features")
 
     if len(test_files) < 2:
-        return (
-            "Not enough files after preprocessing",
-            pd.DataFrame(), None, None, "",
-        )
+        return ("Not enough files after preprocessing",
+                pd.DataFrame(), None, None, "", run_id)
 
     solver = get_qubo_solver(solver_name)
 
-    # --- Optional global cache ---
+    # --- Global cache ---
     global_cache = None
     if reuse_global_cache:
         progress(0.14, desc="Building global validation cache")
@@ -460,45 +548,48 @@ def run_experiment(
                 test_files, features, labels, baseline,
                 tune_mode=tune_mode, n_splits=tune_n_splits,
             )
-            log_step(f"[Run] global cache built, size={len(global_cache)}")
         except Exception as exc:
-            log_step(f"[Run] global cache failed: {exc}, fallback to per-file cache")
+            log_step(f"[Run] global cache failed: {exc}")
             global_cache = None
 
-    # --- LOFO Loop ---
-    rows = []
-    detail_cache = {}
-    skipped = []
+    # --- Main Loop ---
     loop_total = max(1, len(test_files))
-
     for idx, test_file in enumerate(test_files):
         progress(
             0.15 + 0.8 * ((idx + 1) / loop_total),
             desc=f"Evaluating {test_file}",
         )
+
+        if test_file in done_files:
+            log_step(f"[File] skip (already done): {test_file}")
+            continue
+
         file_start = time.perf_counter()
         log_step(f"[File] {idx + 1}/{len(test_files)} test={test_file}")
 
         train_files = [f for f in test_files if f != test_file]
         if len(train_files) < 2:
             skipped.append(f"{test_file}: not enough training files")
+            save_checkpoint(run_id, rows, detail_cache, skipped, config)
             continue
 
         try:
             if global_cache is not None:
                 score_cache = {k: v for k, v in global_cache.items() if k != test_file}
-                log_step(f"[File] reuse global cache, size={len(score_cache)}")
             else:
                 score_cache = build_validation_score_cache(
                     train_files, features, labels, baseline,
-                    tune_mode=tune_mode, n_splits=min(tune_n_splits, len(train_files)),
+                    tune_mode=tune_mode,
+                    n_splits=min(tune_n_splits, len(train_files)),
                 )
         except Exception as exc:
             skipped.append(f"{test_file}: cache build failed ({exc})")
+            save_checkpoint(run_id, rows, detail_cache, skipped, config)
             continue
 
         if not score_cache:
             skipped.append(f"{test_file}: empty score cache")
+            save_checkpoint(run_id, rows, detail_cache, skipped, config)
             continue
 
         try:
@@ -507,6 +598,7 @@ def run_experiment(
             )
         except Exception as exc:
             skipped.append(f"{test_file}: QUBO tuning failed ({exc})")
+            save_checkpoint(run_id, rows, detail_cache, skipped, config)
             continue
 
         x_train = np.concatenate([features[f] for f in train_files])
@@ -516,6 +608,7 @@ def run_experiment(
 
         if len(np.unique(y_train)) < 2:
             skipped.append(f"{test_file}: single class in training labels")
+            save_checkpoint(run_id, rows, detail_cache, skipped, config)
             continue
 
         try:
@@ -524,6 +617,7 @@ def run_experiment(
             y_qubo = safe_solver_call(solver, scores, best_lambda, best_threshold)
         except Exception as exc:
             skipped.append(f"{test_file}: inference failed ({exc})")
+            save_checkpoint(run_id, rows, detail_cache, skipped, config)
             continue
 
         has_seizure = bool(y_test.sum() > 0)
@@ -560,16 +654,20 @@ def run_experiment(
             "best_threshold": best_threshold,
         }
 
+        # 🔑 每個 file 完成都寫 checkpoint
+        save_checkpoint(run_id, rows, detail_cache, skipped, config)
+
         log_step(
-            f"[File] done {test_file}, seizure={has_seizure}, "
-            f"baseline_f1={baseline_f1:.4f}, qubo_f1={qubo_f1:.4f}, "
-            f"Δ={qubo_f1 - baseline_f1:.4f}, elapsed={time.perf_counter() - file_start:.2f}s"
+            f"[File] done {test_file}, baseline_f1={baseline_f1:.4f}, "
+            f"qubo_f1={qubo_f1:.4f}, Δ={qubo_f1 - baseline_f1:.4f}, "
+            f"elapsed={time.perf_counter() - file_start:.2f}s"
         )
 
-    # --- Aggregate & Report ---
+    # --- Aggregate ---
     if not rows:
         note_text = "\n".join(notes + skipped) or "No valid result"
-        return f"Run failed\n\n{note_text}", pd.DataFrame(), None, None, ""
+        return (f"Run failed\n\n{note_text}",
+                pd.DataFrame(), None, None, "", run_id)
 
     result_df = (
         pd.DataFrame(rows)
@@ -579,10 +677,8 @@ def run_experiment(
 
     seizure_df = result_df[result_df["has_seizure"]]
     nonseizure_df = result_df[~result_df["has_seizure"]]
-
     summary_fig = build_summary_plot(result_df)
 
-    # Prefer seizure file for detail view
     if len(seizure_df) > 0:
         top_file = seizure_df.sort_values("improvement", ascending=False).iloc[0]["file"]
     else:
@@ -591,9 +687,9 @@ def run_experiment(
 
     progress(0.96, desc="Saving results")
 
-    # --- Save pkl ---
     meta = {
         "timestamp": datetime.now().isoformat(),
+        "run_id": run_id,
         "subjects": list(selected_subjects),
         "baseline": baseline,
         "solver_name": solver_name,
@@ -616,30 +712,28 @@ def run_experiment(
     if save_pkl:
         try:
             saved_path = save_results_pkl(result_df, detail_cache, meta)
+            # 訓練完成後清理 checkpoint
+            clear_checkpoint(run_id)
         except Exception as exc:
-            log_step(f"[Save] failed: {exc}")
             saved_path = f"(save failed: {exc})"
 
     progress(1.0, desc="Done")
 
-    # --- Summary text ---
     summary_text = (
+        f"Run ID: {run_id}\n"
         f"Finished {len(result_df)} files "
         f"(seizure={len(seizure_df)}, non-seizure={len(nonseizure_df)})\n"
         f"Subjects: {', '.join(selected_subjects)}\n"
         f"Baseline={baseline}, Solver={solver_name}, "
-        f"TuningMode={tune_mode}, Nfold={tune_n_splits}, ReuseCache={reuse_global_cache}\n"
-        f"λ grid={lambda_list}, θ grid={threshold_list}"
+        f"TuningMode={tune_mode}, Nfold={tune_n_splits}\n"
     )
 
-    summary_text += "\n\n[Seizure files]"
+    summary_text += "\n[Seizure files]"
     if len(seizure_df) > 0:
         summary_text += (
             f"\n  Mean baseline F1 = {seizure_df['baseline_f1'].mean():.4f}"
             f"\n  Mean QUBO F1     = {seizure_df['qubo_f1'].mean():.4f}"
             f"\n  Mean Δ F1        = {seizure_df['improvement'].mean():.4f}"
-            f"\n  Mean baseline Recall = {seizure_df['baseline_recall'].mean():.4f}"
-            f"\n  Mean QUBO Recall     = {seizure_df['qubo_recall'].mean():.4f}"
         )
     else:
         summary_text += "\n  (none)"
@@ -653,52 +747,120 @@ def run_experiment(
     else:
         summary_text += "\n  (none)"
 
-    note_lines = []
-    if notes:
-        note_lines.append("Notes:")
-        note_lines.extend(f"- {n}" for n in notes)
-    if skipped:
-        note_lines.append("Skipped:")
-        note_lines.extend(f"- {s}" for s in skipped[:10])
-        if len(skipped) > 10:
-            note_lines.append(f"- ... and {len(skipped) - 10} more")
-    if note_lines:
-        summary_text += "\n\n" + "\n".join(note_lines)
+    if notes or skipped:
+        summary_text += "\n\n"
+        if notes:
+            summary_text += "Notes:\n" + "\n".join(f"- {n}" for n in notes)
+        if skipped:
+            summary_text += "\nSkipped:\n" + "\n".join(f"- {s}" for s in skipped[:10])
+            if len(skipped) > 10:
+                summary_text += f"\n- ... and {len(skipped) - 10} more"
 
     log_step(
-        f"[Run] done, evaluated={len(result_df)}, skipped={len(skipped)}, "
+        f"[Run] done, evaluated={len(result_df)}, "
         f"total={time.perf_counter() - run_start:.2f}s"
     )
 
-    return summary_text, result_df, summary_fig, detail_fig, saved_path
+    return summary_text, result_df, summary_fig, detail_fig, saved_path, run_id
+
+
+# ---------------------------------------------------------------------------
+# Viewer Tab Callbacks
+# ---------------------------------------------------------------------------
+
+def refresh_pkl_list():
+    files = list_result_pkls()
+    return gr.update(choices=files, value=files[0] if files else None)
+
+
+def load_and_display_pkl(pkl_path):
+    if not pkl_path:
+        return "No file selected", pd.DataFrame(), None, None, gr.update(choices=[])
+
+    try:
+        payload = load_result_pkl(pkl_path)
+    except Exception as exc:
+        return f"Failed to load: {exc}", pd.DataFrame(), None, None, gr.update(choices=[])
+
+    meta = payload.get("meta", {})
+    result_df = payload.get("result_df", pd.DataFrame())
+    detail_cache = payload.get("detail_cache", {})
+
+    meta_md = format_meta(meta)
+    summary_fig = build_summary_plot(result_df) if len(result_df) > 0 else None
+    if summary_fig:
+        summary_fig.suptitle(f"Baseline {meta.get('baseline', '')}, tune mode: {meta.get('tune_mode', '')}", fontsize=16)
+        summary_fig.tight_layout(rect=(0, 0, 1, 0.95))
+
+    # 預設挑 improvement 最高的 seizure file
+    detail_fig = None
+    default_file = None
+    if len(result_df) > 0:
+        seizure_df = result_df[result_df["has_seizure"]]
+        if len(seizure_df) > 0:
+            default_file = seizure_df.sort_values("improvement", ascending=False).iloc[0]["file"]
+        else:
+            default_file = result_df.iloc[0]["file"]
+        if default_file in detail_cache:
+            detail_fig = build_detail_plot(
+                detail_cache[default_file],
+                meta.get("baseline", "svm"),
+                meta.get("solver_name", ""),
+            )
+
+    file_choices = list(detail_cache.keys())
+    return (
+        meta_md,
+        result_df,
+        summary_fig,
+        detail_fig,
+        gr.update(choices=file_choices, value=default_file),
+    )
+
+
+def show_file_detail(pkl_path, file_name):
+    if not pkl_path or not file_name:
+        return None
+    try:
+        payload = load_result_pkl(pkl_path)
+    except Exception:
+        return None
+    detail_cache = payload.get("detail_cache", {})
+    meta = payload.get("meta", {})
+    if file_name not in detail_cache:
+        return None
+    return build_detail_plot(
+        detail_cache[file_name],
+        meta.get("baseline", "svm"),
+        meta.get("solver_name", ""),
+    )
 
 
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
 
-def build_ui():
+def build_training_tab():
     subjects = discover_subjects()
 
-    with gr.Blocks(title="QUBO Seizure UI") as demo:
-        gr.Markdown("# QUBO Seizure Experiment Dashboard")
+    with gr.Column():
+        gr.Markdown("## 🧪 Training / Evaluation")
         gr.Markdown(
             "Leave-one-file-out evaluation with inner-validation QUBO tuning. "
-            "Metrics are reported separately for seizure vs non-seizure files."
+            "中斷可續跑:勾選 **Resume** 後,相同設定會從 checkpoint 繼續。"
         )
 
         if not subjects:
             gr.Markdown(
                 "⚠️ **No subjects found under `DESTINATION/`.** "
-                "Please check that the directory exists and contains `chbXX` folders."
+                "Please check that the directory exists."
             )
 
-        with gr.Row():
-            selected_subjects = gr.CheckboxGroup(
-                choices=subjects,
-                value=subjects[:1] if subjects else [],
-                label="Subjects (multi-select)",
-            )
+        selected_subjects = gr.CheckboxGroup(
+            choices=subjects,
+            value=subjects[:1] if subjects else [],
+            label="Subjects (multi-select)",
+        )
 
         with gr.Row():
             baseline = gr.Radio(choices=["svm", "xgboost"], value="svm", label="Baseline")
@@ -712,43 +874,42 @@ def build_ui():
             tune_mode = gr.Radio(
                 choices=["lofo", "nfold"], value="nfold", label="Tuning Strategy"
             )
-            tune_n_splits = gr.Slider(
-                2, 10, value=5, step=1,
-                label="Nfold Splits (used only when tune_mode=nfold)",
-            )
+            tune_n_splits = gr.Slider(2, 10, value=5, step=1, label="Nfold Splits")
 
         with gr.Row():
             max_files_per_subject = gr.Slider(
                 0, 30, value=5, step=1, label="Max EDF files per subject (0=all)"
             )
-            n_jobs = gr.Slider(
-                -1, 16, value=-1, step=1,
-                label="Preprocess parallel jobs (0 auto-adjusted to 1)",
-            )
+            n_jobs = gr.Slider(-1, 16, value=-1, step=1, label="Preprocess parallel jobs")
 
         with gr.Row():
             lambda_text = gr.Textbox(
                 value=", ".join(str(x) for x in DEFAULT_LAMBDA_LIST),
-                label="Lambda grid (comma-separated)",
+                label="Lambda grid",
             )
             threshold_text = gr.Textbox(
                 value=", ".join(str(x) for x in DEFAULT_THRESHOLD_LIST),
-                label="Threshold grid (comma-separated)",
+                label="Threshold grid",
             )
 
         with gr.Row():
-            reuse_global_cache = gr.Checkbox(
+            reuse_global_cache = gr.Checkbox(value=True, label="Reuse global validation cache")
+            save_pkl = gr.Checkbox(value=True, label="Save results to ./results/")
+
+        with gr.Row():
+            resume_enabled = gr.Checkbox(
                 value=True,
-                label="Reuse global validation cache (faster; slight leakage in nfold mode)",
+                label="Resume from checkpoint (if exists)",
             )
-            save_pkl = gr.Checkbox(
-                value=True,
-                label="Save results as .pkl into ./results/",
+            force_restart = gr.Checkbox(
+                value=False,
+                label="Force restart (ignore / clear checkpoint)",
             )
 
-        run_button = gr.Button("Run Experiment", variant="primary")
+        run_button = gr.Button("▶ Run Experiment", variant="primary")
 
         summary_output = gr.Textbox(label="Run Summary", lines=14)
+        run_id_output = gr.Textbox(label="Run ID", lines=1)
         result_table = gr.Dataframe(label="Per-file Metrics")
         summary_plot = gr.Plot(label="Overall Visualization")
         detail_plot = gr.Plot(label="Top-Improvement Seizure File Detail")
@@ -762,13 +923,68 @@ def build_ui():
                 max_files_per_subject, n_jobs,
                 lambda_text, threshold_text,
                 reuse_global_cache, save_pkl,
+                resume_enabled, force_restart,
             ],
             outputs=[
                 summary_output, result_table,
                 summary_plot, detail_plot,
-                saved_path_output,
+                saved_path_output, run_id_output,
             ],
         )
+
+
+def build_viewer_tab():
+    with gr.Column():
+        gr.Markdown("## 📂 Result Viewer")
+        gr.Markdown("載入 `results/` 下的 `.pkl` 檔,檢視先前實驗結果。")
+
+        with gr.Row():
+            pkl_dropdown = gr.Dropdown(
+                choices=list_result_pkls(),
+                label="Select .pkl file",
+                interactive=True,
+            )
+            refresh_btn = gr.Button("🔄 Refresh list")
+            load_btn = gr.Button("📥 Load", variant="primary")
+
+        meta_output = gr.Markdown(label="Metadata")
+        viewer_table = gr.Dataframe(label="Per-file Metrics")
+        viewer_summary_plot = gr.Plot(label="Overall Visualization")
+
+        with gr.Row():
+            file_selector = gr.Dropdown(
+                choices=[], label="Select file to view detail", interactive=True
+            )
+        viewer_detail_plot = gr.Plot(label="File Detail")
+
+        refresh_btn.click(fn=refresh_pkl_list, inputs=[], outputs=[pkl_dropdown])
+
+        load_btn.click(
+            fn=load_and_display_pkl,
+            inputs=[pkl_dropdown],
+            outputs=[
+                meta_output, viewer_table,
+                viewer_summary_plot, viewer_detail_plot,
+                file_selector,
+            ],
+        )
+
+        file_selector.change(
+            fn=show_file_detail,
+            inputs=[pkl_dropdown, file_selector],
+            outputs=[viewer_detail_plot],
+        )
+
+
+def build_ui():
+    with gr.Blocks(title="QUBO Seizure UI") as demo:
+        gr.Markdown("# 🧠 QUBO Seizure Experiment Dashboard")
+
+        with gr.Tabs():
+            with gr.Tab("🧪 Training"):
+                build_training_tab()
+            with gr.Tab("📂 Viewer"):
+                build_viewer_tab()
 
     return demo
 
